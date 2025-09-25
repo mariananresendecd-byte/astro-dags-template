@@ -12,7 +12,7 @@ import pandas as pd
 from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
 
 # ====== CONFIG ======
-GCP_PROJECT  = "hardy-messenger-229417"      # e.g., "my-gcp-project"
+GCP_PROJECT  = "learned-cosine-471123-r4"      # e.g., "my-gcp-project"
 BQ_DATASET   = "crypto"                    # e.g., "crypto"
 BQ_TABLE     = "bitcoin_history_hourly"    # e.g., "bitcoin_history_hourly"
 BQ_LOCATION  = "US"                        # dataset location: "US" or "EU"
