@@ -113,7 +113,7 @@ def fetch_and_to_gbq():
     },
     tags=["bitcoin", "etl", "coingecko", "bigquery", "pandas-gbq"],
 )
-def bitcoin_etl_bigquery():
+def bitcoin_etl_bigquery2():
     fetch_and_to_gbq()
 
-dag = bitcoin_etl_bigquery()
+dag = bitcoin_etl_bigquery2()
