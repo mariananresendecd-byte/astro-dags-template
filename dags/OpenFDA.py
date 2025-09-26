@@ -10,40 +10,34 @@ from datetime import datetime, timedelta
 import time
 import requests
 import pandas as pd
-import pytz
-import math
 import logging
 import os
 
-# ==== CONFIGURAÇÕES (edite aqui OU use Variables/Env) ====
-PROJECT_ID = "learned-cosine-471123-r4"   # já informado por você
-BQ_DATASET = os.getenv("BQ_DATASET", "openfda")  # informe seu dataset
-BQ_TABLE   = os.getenv("BQ_TABLE",   "drug_event_daily_counts")  # informe sua tabela
-BQ_LOCATION = os.getenv("BQ_LOCATION", "US")  # local do BigQuery (US, EU, southamerica-east1, etc.)
-GCP_CONN_ID = os.getenv("GCP_CONN_ID", "google_cloud_default")  # se preferir usar pandas_gbq com ADC, pode ignorar
+# ==== IDENTIFICAÇÃO DO DEPLOYMENT (pedido do usuário) ====
+# Este ID é usado no processo de deploy (astro deploy --deployment <ID>).
+# Mantido aqui para referência e logging operacional.
+ASTRONOMER_DEPLOYMENT_ID = "cmfv4iy9a2hi301qf0hlm0xdv"
 
-# Termo do medicamento (altere se quiser outro):
+# ==== CONFIGURAÇÕES (edite aqui OU use Variáveis de Ambiente) ====
+PROJECT_ID  = "learned-cosine-471123-r4"                    # seu projeto BQ
+BQ_DATASET  = os.getenv("BQ_DATASET", "openfda")            # dataset BQ
+BQ_TABLE    = os.getenv("BQ_TABLE", "drug_event_daily_counts")  # tabela BQ
+BQ_LOCATION = os.getenv("BQ_LOCATION", "US")                # ex.: US, EU, southamerica-east1
 MEDICINAL_PRODUCT = os.getenv("OPENFDA_MEDICINAL_PRODUCT", "sildenafil citrate")
 
-# Limites/Backoff
+# Endpoint/OpenFDA
 OPENFDA_BASE = "https://api.fda.gov/drug/event.json"
 MAX_RETRIES = 5
 INITIAL_BACKOFF_SEC = 2
 
-# ==== Funções auxiliares ====
 
-def _openfda_count_by_date(date_str, medicinal_product):
+def _openfda_count_by_date(date_str: str, medicinal_product: str) -> pd.DataFrame:
     """
-    Faz uma chamada ao OpenFDA para retornar a contagem por 'receivedate' em uma janela de 1 dia.
-    Retorna um DataFrame com colunas: date (DATE), count (INT64), search_term (STRING).
+    Busca contagem diária por 'receivedate' para o medicamento informado.
+    Retorna DF com colunas: date (DATE), count (INT64), search_term (STRING).
     """
-    # Janela diária no formato YYYYMMDD
-    start_date = date_str
-    end_date = date_str
-
-    # count por receivedate, limit alto para garantir retorno (count tem bucket limit)
     params = {
-        "search": f'patient.drug.medicinalproduct:"{medicinal_product}" AND receivedate:[{start_date}+TO+{end_date}]',
+        "search": f'patient.drug.medicinalproduct:"{medicinal_product}" AND receivedate:[{date_str}+TO+{date_str}]',
         "count": "receivedate",
         "limit": "10000"
     }
@@ -54,69 +48,65 @@ def _openfda_count_by_date(date_str, medicinal_product):
         if resp.status_code == 200:
             data = resp.json()
             results = data.get("results", [])
-            # Se a API não retornar nada para o dia, criar linha com 0
             if not results:
                 df = pd.DataFrame([{"date": pd.to_datetime(date_str, format="%Y%m%d").date(), "count": 0}])
             else:
                 df = pd.DataFrame(results)
-                # 'time' vem como 'YYYYMMDD'
                 df["date"] = pd.to_datetime(df["time"], format="%Y%m%d").dt.date
                 df = df[["date", "count"]]
             df["search_term"] = medicinal_product
             return df
 
-        # 429/5xx → backoff exponencial
         if resp.status_code in (429, 500, 502, 503, 504):
-            logging.warning(f"OpenFDA HTTP {resp.status_code} (tentativa {attempt}/{MAX_RETRIES}). Aguardando {backoff}s...")
+            logging.warning(
+                f"[{ASTRONOMER_DEPLOYMENT_ID}] OpenFDA HTTP {resp.status_code} "
+                f"(tentativa {attempt}/{MAX_RETRIES}). Backoff {backoff}s..."
+            )
             time.sleep(backoff)
             backoff *= 2
             continue
 
-        # Outros erros → log e retorna DF vazio
-        logging.error(f"Falha OpenFDA: HTTP {resp.status_code} - {resp.text}")
+        logging.error(f"[{ASTRONOMER_DEPLOYMENT_ID}] Falha OpenFDA: HTTP {resp.status_code} - {resp.text}")
         return pd.DataFrame(columns=["date", "count", "search_term"])
 
-    logging.error("Excedeu tentativas no OpenFDA (backoff).")
+    logging.error(f"[{ASTRONOMER_DEPLOYMENT_ID}] Excedeu tentativas no OpenFDA (backoff).")
     return pd.DataFrame(columns=["date", "count", "search_term"])
 
 
 def fetch_openfda_daily(**context):
     """
-    Tarefa diária: usa a execution_date da DAG (UTC) como dia de referência.
+    Usa a execution_date (UTC) como dia de referência (YYYYMMDD).
     """
-    # Airflow usa UTC para execution_date
-    execution_date = context["ds_nodash"]  # 'YYYYMMDD'
-    df = _openfda_count_by_date(execution_date, MEDICINAL_PRODUCT)
-
-    # Envia para XCom (como dict) – pequeno e suficiente
+    date_str = context["ds_nodash"]  # YYYYMMDD
+    logging.info(
+        f"[{ASTRONOMER_DEPLOYMENT_ID}] Coletando OpenFDA para {date_str} | "
+        f"termo='{MEDICINAL_PRODUCT}' → {PROJECT_ID}.{BQ_DATASET}.{BQ_TABLE}"
+    )
+    df = _openfda_count_by_date(date_str, MEDICINAL_PRODUCT)
     context["ti"].xcom_push(key="openfda_daily_df", value=df.to_dict(orient="list"))
 
 
 def save_to_bigquery(**context):
     """
-    Recupera o DF do XCom e grava no BigQuery usando pandas_gbq.
-    Necessário: credenciais GCP válidas (ADC) no ambiente do worker.
+    Reconstrói DF do XCom e grava no BigQuery via pandas_gbq.
+    Requer credenciais GCP válidas (ADC) no worker.
     """
-    # Reconstrói DF
     data = context["ti"].xcom_pull(key="openfda_daily_df", task_ids="fetch_openfda_daily")
     if not data:
-        logging.warning("Nada a gravar no BigQuery (DF vazio).")
+        logging.warning(f"[{ASTRONOMER_DEPLOYMENT_ID}] Nada a gravar (DF vazio).")
         return
 
     df = pd.DataFrame(data)
     if df.empty:
-        logging.info("DF vazio – nenhuma linha para gravar.")
+        logging.info(f"[{ASTRONOMER_DEPLOYMENT_ID}] DF vazio – nenhuma linha para gravar.")
         return
 
-    # Tipagem
     df["date"] = pd.to_datetime(df["date"]).dt.date
     df["count"] = pd.to_numeric(df["count"], errors="coerce").fillna(0).astype(int)
     df["search_term"] = df["search_term"].astype(str)
 
-    # Esquema BigQuery
     table_id = f"{BQ_DATASET}.{BQ_TABLE}"
 
-    # Gravação via pandas_gbq
     from pandas_gbq import to_gbq
     table_schema = [
         {"name": "date", "type": "DATE"},
@@ -124,7 +114,6 @@ def save_to_bigquery(**context):
         {"name": "search_term", "type": "STRING"},
     ]
 
-    # Cria/append (sem particionamento). Se quiser particionar por date, crie a tabela antes com partitioning.
     to_gbq(
         df,
         table_id,
@@ -134,8 +123,9 @@ def save_to_bigquery(**context):
         location=BQ_LOCATION,
         progress_bar=False,
     )
-
-    logging.info(f"{len(df)} linha(s) gravadas em {PROJECT_ID}.{table_id}.")
+    logging.info(
+        f"[{ASTRONOMER_DEPLOYMENT_ID}] {len(df)} linha(s) gravadas em {PROJECT_ID}.{table_id}."
+    )
 
 
 # ==== Definição da DAG ====
@@ -149,9 +139,9 @@ default_args = {
 dag = DAG(
     dag_id="openfda_drug_event_daily_to_bq",
     default_args=default_args,
-    description="Coleta diária de eventos de drug/event (OpenFDA) e carrega contagem por dia no BigQuery",
+    description="OpenFDA drug/event diário → BigQuery (para Looker Studio)",
     schedule_interval="@daily",
-    start_date=datetime(2020, 11, 1),  # habilita catchup desde 2020-11-01
+    start_date=datetime(2020, 11, 1),
     catchup=True,
     max_active_runs=1,
     max_active_tasks=1,
@@ -173,6 +163,8 @@ write_bq = PythonOperator(
 )
 
 fetch_data >> write_bq
+
+
 
 
 
