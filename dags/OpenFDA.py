@@ -170,11 +170,12 @@ def fetch_and_to_gbq():
     params={"medicinal_product": "sildenafil citrate", "create_table_only": False},
     tags=["openfda", "bigquery", "etl", "lookerstudio"],
 )
-def openfda_drug_event_daily_to_bq3():
+def openfda_drug_event_daily_to_bq4():
     ensure_dataset_and_table() >> fetch_and_to_gbq()
 
 
-dag = openfda_drug_event_daily_to_bq3()
+dag = openfda_drug_event_daily_to_bq4()
+
 
 
 
