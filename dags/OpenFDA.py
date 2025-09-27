@@ -12,6 +12,7 @@ import pandas as pd
 import time
 import logging
 import os
+from google.cloud import bigquery
 
 # ====== CONFIG ======
 ASTRONOMER_DEPLOYMENT_ID = "cmfv4iy9a2hi301qf0hlm0xdv"
@@ -37,7 +38,6 @@ def _fetch_openfda_for_date(date_str: str, medicinal_product: str) -> pd.DataFra
         "count": "receivedate",
         "limit": "10000",
     }
-
     backoff = INITIAL_BACKOFF_SEC
     for attempt in range(1, MAX_RETRIES + 1):
         r = requests.get(OPENFDA_BASE, params=params, timeout=60)
@@ -45,6 +45,7 @@ def _fetch_openfda_for_date(date_str: str, medicinal_product: str) -> pd.DataFra
             data = r.json()
             results = data.get("results", [])
             if not results:
+                # Sem eventos para o dia → grava 0 para garantir linha e criar tabela
                 df = pd.DataFrame([{
                     "date": pd.to_datetime(date_str, format="%Y%m%d").date(),
                     "count": 0
@@ -68,29 +69,65 @@ def _fetch_openfda_for_date(date_str: str, medicinal_product: str) -> pd.DataFra
         logging.error(f"[{ASTRONOMER_DEPLOYMENT_ID}] Falha OpenFDA: {r.status_code} - {r.text}")
         break
 
+    # Falha geral → DF vazio (não grava)
     return pd.DataFrame(columns=["date", "count", "search_term"])
+
+@task
+def ensure_dataset_and_table():
+    """Garante dataset e tabela (particionada) existentes antes de escrever."""
+    hook = BigQueryHook(gcp_conn_id=GCP_CONN_ID, location=BQ_LOCATION, use_legacy_sql=False)
+    client = hook.get_client(project_id=GCP_PROJECT)
+
+    # Dataset
+    ds_ref = bigquery.Dataset(f"{GCP_PROJECT}.{BQ_DATASET}")
+    ds_ref.location = BQ_LOCATION
+    client.create_dataset(ds_ref, exists_ok=True)
+
+    # Tabela particionada por date e cluster em search_term
+    table_id = f"{GCP_PROJECT}.{BQ_DATASET}.{BQ_TABLE}"
+    try:
+        client.get_table(table_id)
+    except Exception:
+        schema = [
+            bigquery.SchemaField("date", "DATE"),
+            bigquery.SchemaField("count", "INTEGER"),
+            bigquery.SchemaField("search_term", "STRING"),
+        ]
+        table = bigquery.Table(table_id, schema=schema)
+        table.time_partitioning = bigquery.TimePartitioning(
+            type_=bigquery.TimePartitioningType.DAY, field="date"
+        )
+        table.clustering_fields = ["search_term"]
+        client.create_table(table)
+        logging.info(f"✅ Tabela criada: {table_id} (partitioned/clustering)")
 
 @task
 def fetch_and_to_gbq():
     """
-    Busca os dados do OpenFDA para a data da execução e grava no BigQuery.
-    O medicamento é lido de params (passado via JSON no Trigger DAG).
+    Busca os dados do OpenFDA e grava no BigQuery.
+    Params aceitos no Trigger:
+      - medicinal_product (str)  ex.: "ibuprofen"
+      - create_table_only (bool) se true, só garante a tabela e sai
     """
     ctx = get_current_context()
     start = ctx["data_interval_start"]
     date_str = start.format("YYYYMMDD")
 
-    # pega o param "medicinal_product" (ou default sildenafil citrate)
     medicinal_product = ctx["params"].get("medicinal_product", "sildenafil citrate")
+    create_table_only = bool(ctx["params"].get("create_table_only", False))
 
-    logging.info(
-        f"[{ASTRONOMER_DEPLOYMENT_ID}] Coletando OpenFDA para {date_str} | "
-        f"termo='{medicinal_product}' → {GCP_PROJECT}.{BQ_DATASET}.{BQ_TABLE}"
-    )
+    logging.info(f"[DBG] project={GCP_PROJECT} dataset={BQ_DATASET} table={BQ_TABLE} location={BQ_LOCATION}")
+    logging.info(f"[DBG] params: medicinal_product='{medicinal_product}', create_table_only={create_table_only}")
+
+    if create_table_only:
+        logging.info("create_table_only=True → não fará fetch nem write.")
+        return
 
     df = _fetch_openfda_for_date(date_str, medicinal_product)
+    logging.info(f"[DBG] df shape={df.shape} head3={df.head(3).to_dict(orient='records')}")
+
     if df.empty:
-        logging.warning("Nada a gravar no BigQuery (DF vazio).")
+        logging.warning("DF vazio — não gravará no BigQuery.")
         return
 
     df["date"] = pd.to_datetime(df["date"]).dt.date
@@ -98,44 +135,45 @@ def fetch_and_to_gbq():
     df["search_term"] = df["search_term"].astype(str)
     df = df.drop_duplicates(subset=["date", "search_term"]).sort_values("date")
 
-    # credenciais do Airflow connection
     bq_hook = BigQueryHook(gcp_conn_id=GCP_CONN_ID, location=BQ_LOCATION, use_legacy_sql=False)
     credentials = bq_hook.get_credentials()
 
-    destination_table = f"{BQ_DATASET}.{BQ_TABLE}"
-    table_schema = [
-        {"name": "date",        "type": "DATE"},
-        {"name": "count",       "type": "INTEGER"},
-        {"name": "search_term", "type": "STRING"},
-    ]
-
-    df.to_gbq(
-        destination_table=destination_table,
-        project_id=GCP_PROJECT,
-        if_exists="append",
-        credentials=credentials,
-        table_schema=table_schema,
-        location=BQ_LOCATION,
-        progress_bar=False,
-    )
-
-    logging.info(f"Loaded {len(df)} rows to {GCP_PROJECT}.{destination_table} (location={BQ_LOCATION}).")
-
-from airflow.decorators import dag
+    try:
+        df.to_gbq(
+            destination_table=f"{BQ_DATASET}.{BQ_TABLE}",
+            project_id=GCP_PROJECT,
+            if_exists="append",
+            credentials=credentials,
+            table_schema=[
+                {"name": "date", "type": "DATE"},
+                {"name": "count", "type": "INTEGER"},
+                {"name": "search_term", "type": "STRING"},
+            ],
+            location=BQ_LOCATION,
+            progress_bar=False,
+        )
+        logging.info(f"✅ Loaded {len(df)} rows to {GCP_PROJECT}.{BQ_DATASET}.{BQ_TABLE}")
+    except Exception as e:
+        import traceback
+        logging.error("❌ to_gbq FAILED")
+        logging.error(repr(e))
+        logging.error(traceback.format_exc())
+        raise
 
 @dag(
     default_args=DEFAULT_ARGS,
-    schedule="0 0 * * *",  # diária
+    schedule="0 0 * * *",      # diária
     start_date=pendulum.datetime(2025, 9, 25, tz="UTC"),
     catchup=False,
     max_active_runs=1,
-    params={"medicinal_product": "sildenafil citrate"},  # default
+    params={"medicinal_product": "sildenafil citrate", "create_table_only": False},
     tags=["openfda", "bigquery", "lookerstudio", "etl"],
 )
 def openfda_drug_event_daily_to_bq3():
-    fetch_and_to_gbq()
+    ensure_dataset_and_table() >> fetch_and_to_gbq()
 
 dag = openfda_drug_event_daily_to_bq3()
+
 
 
 
