@@ -133,10 +133,11 @@ def fetch_and_to_gbq():
     max_active_runs=1,
     tags=["openfda", "bigquery", "lookerstudio", "etl"],
 )
-def openfda_drug_event_daily_to_bq():
+def openfda_drug_event_daily_to_bq2():
     fetch_and_to_gbq()
 
-dag = openfda_drug_event_daily_to_bq()
+dag = openfda_drug_event_daily_to_bq2()
+
 
 
 
