@@ -20,9 +20,9 @@ BQ_TABLE_COUNT = "openfda_covid_vaccine"        # contagem diária
 BQ_LOCATION    = "US"
 GCP_CONN_ID    = "google_cloud_default"
 
-# Jan -> Jun/2025 (exemplo de janela fixa)
+# Jan -> set/2025 
 TEST_START = date(2025, 1, 1)
-TEST_END   = date(2025, 6, 30)
+TEST_END   = date(2025, 9, 25)
 DRUG_QUERY = "COVID-19 vaccine"
 
 TIMEOUT_S   = 30
@@ -183,6 +183,7 @@ def openfda_covid_vaccine_stage_pipeline():
     build_daily_counts(extract_transform_load())
 
 openfda_covid_vaccine_stage_pipeline()
+
 
 
 
